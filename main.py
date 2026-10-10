@@ -1,168 +1,188 @@
 import os
-from datetime import datetime
-
-import httpx
-from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException
+import json
+import requests
+from typing import List
+from fastapi import FastAPI, HTTPException, Depends
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from sqlalchemy import and_, select
-from sqlalchemy.exc import IntegrityError
+from dotenv import load_dotenv
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 
 from database.db import get_db
 from database.models import Conversation, Message
 
 load_dotenv()
 
-RODIUMAI_URL = "https://api.rodiumai.io/v1/chat/completions"
-RODIUMAI_API_KEY = os.environ["RODIUMAI_API_KEY"]
-MODEL = os.getenv("RODIUMAI_MODEL", "anthropic/claude-sonnet-4-5-20250929")
-PREVIEW_LENGTH = 60
+app = FastAPI(title="Study Buddy Backend")
 
-# Roles the LLM understands. Anything else stored in the DB (e.g. notifications) stays out of its prompt.
-LLM_ROLES = {"user", "assistant"}
-NOTIFICATION_ROLE = "system-notification"
-NOTIFICATION_EVERY = 10  # a notification each time the dialogue reaches a multiple of this many messages
-NOTIFICATION_TEXT = "Notification système : Une dizaine de messages écrits."
+ALLOWED_MODELS = [m.strip() for m in os.getenv("ALLOWED_MODELS", "openai/gpt-4o-mini,openai/gpt-4o").split(",")]
+API_KEY = os.getenv("RODIUM_API_KEY")
+RODIUM_API_URL = "https://api.rodiumai.io/v1/chat/completions"
 
-SYSTEM_PROMPT = (
-    "Tu es Study Buddy, un tuteur bienveillant pour les étudiants."
-    "Réponds aux questions de manière claire et concise."
-)
-
-app = FastAPI(title="Study Buddy Chatbot")
-
-
-class ConversationResponse(BaseModel):
-    conversation_id: int
-
-
-class ConversationSummary(BaseModel):
-    id: int
-    created_at: datetime
-    preview: str | None  # first user message, truncated; None while the conversation is empty
-
+def load_system_prompt() -> str:
+    path = os.path.join("prompts", "system.md")
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+    return "Tu es Study Buddy, un tuteur pédagogique."
 
 class ChatRequest(BaseModel):
     conversation_id: int
     message: str
+    model: str
+    role: str = "user"  # "user" ou "note"
 
+def get_next_seq(db: Session, conversation_id: int) -> int:
+    max_seq = db.query(func.max(Message.seq)).filter(Message.conversation_id == conversation_id).scalar()
+    return (max_seq or 0) + 1
 
-class ChatResponse(BaseModel):
-    reply: str
-    notification: str | None = None  # set when this turn also stored a system-notification
+def prepare_llm_messages(db_messages: List[Message]) -> List[dict]:
+    llm_messages = [{"role": "system", "content": load_system_prompt()}]
+    for msg in db_messages:
+        # EXCLUSION : Le rôle "note" est filtré et JAMAIS envoyé au LLM
+        if msg.role in ["user", "assistant", "system"]:
+            llm_messages.append({"role": msg.role, "content": msg.content})
+    return llm_messages
 
+# --- ROUTES REQUISES PAR LE FRONTEND ---
 
-class MessageResponse(BaseModel):
-    seq: int
-    role: str
-    content: str
-    created_at: datetime
-
-
-def load_messages(db: Session, conversation_id: int) -> list[Message]:
-    # A conversation's messages in order; 404 if the conversation doesn't exist.
-    if db.get(Conversation, conversation_id) is None:
-        raise HTTPException(status_code=404, detail="Conversation not found.")
-    return db.scalars(
-        select(Message)
-        .where(Message.conversation_id == conversation_id)
-        .order_by(Message.seq)
-    ).all()
-
-
-def build_llm_history(rows: list[Message]) -> list[dict]:
-    # The DB history is not necessarily what the LLM sees: filter it here, just before building the request.
-    # For now we only drop the roles the LLM doesn't know (system-notification).
-    return [{"role": m.role, "content": m.content} for m in rows if m.role in LLM_ROLES]
-
-
-@app.post("/conversations", status_code=201)
-def create_conversation(db: Session = Depends(get_db)) -> ConversationResponse:
-    conversation = Conversation()
-    db.add(conversation)
-    db.commit()
-    return ConversationResponse(conversation_id=conversation.id)
-
+@app.get("/models")
+def get_models():
+    return {"models": ALLOWED_MODELS}
 
 @app.get("/conversations")
-def list_conversations(db: Session = Depends(get_db)) -> list[ConversationSummary]:
-    # Newest first, each joined to its first message (seq 1, always the user's) for the preview.
-    rows = db.execute(
-        select(Conversation, Message.content)
-        .outerjoin(Message, and_(Message.conversation_id == Conversation.id, Message.seq == 1))
-        .order_by(Conversation.id.desc())
-    ).all()
-    return [
-        ConversationSummary(
-            id=conversation.id,
-            created_at=conversation.created_at,
-            preview=content[:PREVIEW_LENGTH] if content else None,
+def list_conversations(db: Session = Depends(get_db)):
+    convs = db.query(Conversation).order_by(Conversation.id.desc()).all()
+    result = []
+    for c in convs:
+        first_msg = (
+            db.query(Message)
+            .filter(Message.conversation_id == c.id)
+            .order_by(Message.seq.asc())
+            .first()
         )
-        for conversation, content in rows
-    ]
+        preview = first_msg.content[:30] + "..." if first_msg else None
+        result.append({
+            "id": c.id,
+            "created_at": c.created_at.isoformat() if c.created_at else "",
+            "preview": preview
+        })
+    return result
 
+@app.post("/conversations")
+def create_conversation(db: Session = Depends(get_db)):
+    new_conv = Conversation()
+    db.add(new_conv)
+    db.commit()
+    db.refresh(new_conv)
+    return {"conversation_id": new_conv.id}
 
 @app.get("/conversations/{conversation_id}/messages")
-def list_messages(conversation_id: int, db: Session = Depends(get_db)) -> list[MessageResponse]:
+def get_messages(conversation_id: int, db: Session = Depends(get_db)):
+    msgs = (
+        db.query(Message)
+        .filter(Message.conversation_id == conversation_id)
+        .order_by(Message.seq.asc())
+        .all()
+    )
     return [
-        MessageResponse(seq=m.seq, role=m.role, content=m.content, created_at=m.created_at)
-        for m in load_messages(db, conversation_id)
+        {
+            "seq": m.seq,
+            "role": m.role,
+            "content": m.content,
+            "created_at": m.created_at.isoformat() if m.created_at else ""
+        }
+        for m in msgs
     ]
 
+# --- ENDPOINT STREAMING ---
 
-@app.post("/chat")
-def chat(req: ChatRequest, db: Session = Depends(get_db)) -> ChatResponse:
-    # Load this conversation from the database, in message order.
-    rows = load_messages(db, req.conversation_id)
-    history = build_llm_history(rows)
-    # seq follows every stored row (notifications included) so it stays unique.
-    next_seq = rows[-1].seq + 1 if rows else 1
-    user_message = {"role": "user", "content": req.message}
-
-    # The LLM is stateless: resend the system prompt + the whole conversation each turn.
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}, *history, user_message]
-
-    try:
-        response = httpx.post(
-            RODIUMAI_URL,
-            headers={"Authorization": f"Bearer {RODIUMAI_API_KEY}"},
-            json={
-                "model": MODEL,
-                "messages": messages, 
-                "max_tokens": 512,
-                "stream": False,
-            },
-            timeout=30,
-        )
-        response.raise_for_status()
-    except httpx.HTTPError as exc:
-        raise HTTPException(status_code=502, detail="The LLM API call failed.") from exc
-
-    reply = response.json()["choices"][0]["message"]["content"]
-
-    # Only record the turn once the call succeeded, so a failure doesn't leave a dangling user message.
-    db.add_all([
-        Message(conversation_id=req.conversation_id, seq=next_seq, role="user", content=req.message),
-        Message(conversation_id=req.conversation_id, seq=next_seq + 1, role="assistant", content=reply),
-    ])
-
-    # Count only the dialogue (user + assistant): counting notifications too would shift the total
-    # off the multiples of 10 for good after the first one.
-    notification = None
-    if (len(history) + 2) % NOTIFICATION_EVERY == 0:
-        notification = NOTIFICATION_TEXT
-        db.add(Message(
-            conversation_id=req.conversation_id, seq=next_seq + 2, role=NOTIFICATION_ROLE, content=notification
-        ))
-
-    try:
-        db.commit()
-    except IntegrityError:
-        # Another request already wrote these seq numbers in this conversation while we waited for the LLM.
-        db.rollback()
+@app.post("/chat/stream")
+def chat_stream(req: ChatRequest, db: Session = Depends(get_db)):
+    if req.model not in ALLOWED_MODELS:
         raise HTTPException(
-            status_code=409, detail="The conversation was updated concurrently, please retry."
+            status_code=400, 
+            detail=f"Modèle '{req.model}' non autorisé. Choisissez parmi : {ALLOWED_MODELS}"
         )
-    print(history)
-    return ChatResponse(reply=reply, notification=notification)
+
+    conv = db.query(Conversation).filter(Conversation.id == req.conversation_id).first()
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation introuvable.")
+
+    user_seq = get_next_seq(db, req.conversation_id)
+    user_msg_db = Message(
+        conversation_id=req.conversation_id,
+        seq=user_seq,
+        role=req.role,
+        content=req.message
+    )
+    db.add(user_msg_db)
+    db.commit()
+
+    if req.role == "note":
+        def note_stream():
+            yield f"data: {json.dumps({'content': '📝 Note enregistrée avec succès.'})}\n\n"
+            yield "data: [DONE]\n\n"
+        return StreamingResponse(note_stream(), media_type="text/event-stream")
+
+    existing_messages = (
+        db.query(Message)
+        .filter(Message.conversation_id == req.conversation_id)
+        .order_by(Message.seq.asc())
+        .all()
+    )
+    llm_messages = prepare_llm_messages(existing_messages)
+
+    headers = {
+        "Authorization": f"Bearer {API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": req.model,
+        "messages": llm_messages,
+        "stream": True
+    }
+
+    def event_generator():
+        full_response = ""
+        try:
+            with requests.post(RODIUM_API_URL, json=payload, headers=headers, stream=True) as resp:
+                if resp.status_code != 200:
+                    yield f"data: {json.dumps({'error': f'Erreur API (Code {resp.status_code})'})}\n\n"
+                    return
+
+                for line in resp.iter_lines():
+                    if line:
+                        line_str = line.decode("utf-8")
+                        if line_str.startswith("data: "):
+                            data_str = line_str[6:].strip()
+                            if data_str == "[DONE]":
+                                break
+                            try:
+                                chunk = json.loads(data_str)
+                                delta = chunk["choices"][0]["delta"].get("content", "")
+                                if delta:
+                                    full_response += delta
+                                    yield f"data: {json.dumps({'content': delta})}\n\n"
+                            except Exception:
+                                pass
+
+            if full_response:
+                assistant_seq = get_next_seq(db, req.conversation_id)
+                assistant_msg_db = Message(
+                    conversation_id=req.conversation_id,
+                    seq=assistant_seq,
+                    role="assistant",
+                    content=full_response
+                )
+                db.add(assistant_msg_db)
+                db.commit()
+
+            yield "data: [DONE]\n\n"
+
+        except Exception as e:
+            db.rollback()
+            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
