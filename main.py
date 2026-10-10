@@ -8,14 +8,14 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 from sqlalchemy.orm import Session
 from sqlalchemy import func
-
-from database.db import get_db
+from database.db import get_db, engine, Base  
 from database.models import Conversation, Message
 
 load_dotenv()
 
 app = FastAPI(title="Study Buddy Backend")
 
+Base.metadata.create_all(bind=engine)
 ALLOWED_MODELS = [m.strip() for m in os.getenv("ALLOWED_MODELS", "openai/gpt-4o-mini,openai/gpt-4o").split(",")]
 API_KEY = os.getenv("RODIUM_API_KEY")
 RODIUM_API_URL = "https://api.rodiumai.io/v1/chat/completions"
