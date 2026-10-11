@@ -126,6 +126,51 @@ L'API est accessible sur <http://127.0.0.1:8000> et la documentation interactive
 
 ---
 
+## 🖥️ Lancer l'application complète en local (Backend + Frontend)
+
+Pour faire tourner le projet sur votre machine, il faut lancer les deux parties, chacune dans son propre terminal.
+
+**1. Lancer le backend :**
+
+```bash
+cd backend
+uv run uvicorn main:app --reload
+```
+
+**2. Lancer le frontend :**
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+De cette façon, quiconque fork le projet peut le faire tourner instantanément sur sa machine, sans être bloqué par une URL de Codespace.
+
+> **Note pour les correcteurs :** Ce projet est configuré pour tourner sous GitHub Codespaces ou en local. Le frontend communique avec le backend via le proxy Vite pointant sur le port `8000`.
+
+### ☁️ Utilisation dans GitHub Codespaces
+
+Si le projet est ouvert dans un **GitHub Codespaces**, le port du backend (`8000`) doit impérativement être rendu **public**. Sans cela, le frontend ne pourra pas joindre l'API.
+
+Pour cela, dans l'onglet **Ports** de Codespaces, faites un clic droit sur le port `8000` puis **Port Visibility → Public**.
+
+---
+
+## ✅ Preuves de test
+
+Captures d'écran de l'application en fonctionnement (frontend connecté au backend, avec sélecteur de modèle et option « Note personnelle ») :
+
+**1. Nouvelle conversation vide** — le sélecteur de modèle (`openai/gpt-4o-mini`) et la case « Envoyer comme Note personnelle (non transmise au LLM) » sont visibles.
+
+![Nouvelle conversation] /imag€s/Capture d’écran du 2026-10-11 02-24-39.png
+
+**2. Conversation avec réponse streamée** — le tuteur répond de façon pédagogique à la question « Comment fonctionne une boucle for en Python ? » en posant des questions guidées, puis détaille ses explications avec exemples de code. La conversation est persistée et apparaît dans la barre latérale.
+
+![Conversation avec réponse du LLM] imag€s/Capture d’écran du 2026-10-11 02-27-32.png
+
+---
+
 ## 📝 Justification de la gestion du rôle custom (`note`)
 
 Le rôle custom `note` permet à l'étudiant d'ajouter des mémos personnels dans le fil de discussion.
@@ -170,4 +215,4 @@ Si le flux est interrompu (coupure réseau, erreur API), une exception est levé
 
 ### 4. Comment votre application garantit-elle que la clé API ne fuit jamais côté navigateur ?
 
-La clé API (`OPENAI_API_KEY`) est chargée uniquement dans l'environnement du serveur backend (`process.env` / `pydantic-settings`). C'est le backend FastAPI qui effectue les appels HTTP sécurisés vers l'API d'OpenAI. Le navigateur frontend communique exclusivement avec notre propre backend via le proxy (`/api`), sans jamais avoir accès aux variables d'environnement du serveur ni aux clés tierces.
+La clé API (`RODIUM_API_KEY`) est chargée uniquement dans l'environnement du serveur backend (`process.env` / `pydantic-settings`). C'est le backend FastAPI qui effectue les appels HTTP sécurisés vers l'API d'OpenAI. Le navigateur frontend communique exclusivement avec notre propre backend via le proxy (`/api`), sans jamais avoir accès aux variables d'environnement du serveur ni aux clés tierces.

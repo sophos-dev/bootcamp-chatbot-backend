@@ -1,6 +1,5 @@
 import os
 import json
-import requests
 from typing import List
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.responses import StreamingResponse
@@ -10,15 +9,25 @@ from sqlalchemy.orm import Session
 from sqlalchemy import func
 from database.db import get_db, engine, Base  
 from database.models import Conversation, Message
+from openai import OpenAI
 
-load_dotenv()
+# override=True : le .env écrase les variables déjà définies dans le système
+load_dotenv(override=True)
 
 app = FastAPI(title="Study Buddy Backend")
 
 Base.metadata.create_all(bind=engine)
 ALLOWED_MODELS = [m.strip() for m in os.getenv("ALLOWED_MODELS", "openai/gpt-4o-mini,openai/gpt-4o").split(",")]
-API_KEY = os.getenv("RODIUM_API_KEY")
 RODIUM_API_URL = "https://api.rodiumai.io/v1/chat/completions"
+
+# Lecture de la clé : on garde tes deux noms possibles, mais on nettoie la valeur
+# (espaces, retours à la ligne, guillemets) et on affiche d'où elle vient.
+_key_name = "RODIUM_API_KEY" if os.getenv("RODIUM_API_KEY") else "RODIUMAI_API_KEY"
+API_KEY = (os.getenv("RODIUM_API_KEY") or os.getenv("RODIUMAI_API_KEY") or "").strip().strip('"').strip("'")
+print(f"[config] variable utilisée : {_key_name}")
+print(f"[config] clé chargée : {API_KEY[:6]}...{API_KEY[-4:]} (longueur {len(API_KEY)})")
+if os.getenv("RODIUM_API_KEY") and os.getenv("RODIUMAI_API_KEY") and os.getenv("RODIUM_API_KEY") != os.getenv("RODIUMAI_API_KEY"):
+    print("[config] ATTENTION : RODIUM_API_KEY et RODIUMAI_API_KEY ont des valeurs différentes")
 
 def load_system_prompt() -> str:
     path = os.path.join("prompts", "system.md")
@@ -96,6 +105,12 @@ def get_messages(conversation_id: int, db: Session = Depends(get_db)):
         for m in msgs
     ]
 
+# Initialisation du client Rodium (avec la clé nettoyée ci-dessus)
+client = OpenAI(
+    api_key=API_KEY,
+    base_url="https://api.rodiumai.io/v1",
+)
+
 # --- ENDPOINT STREAMING ---
 
 @app.post("/chat/stream")
@@ -134,39 +149,23 @@ def chat_stream(req: ChatRequest, db: Session = Depends(get_db)):
     )
     llm_messages = prepare_llm_messages(existing_messages)
 
-    headers = {
-        "Authorization": f"Bearer {API_KEY}",
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "model": req.model,
-        "messages": llm_messages,
-        "stream": True
-    }
-
     def event_generator():
         full_response = ""
         try:
-            with requests.post(RODIUM_API_URL, json=payload, headers=headers, stream=True) as resp:
-                if resp.status_code != 200:
-                    yield f"data: {json.dumps({'error': f'Erreur API (Code {resp.status_code})'})}\n\n"
-                    return
+            # Appel officiel via le SDK OpenAI pointant sur Rodium
+            stream = client.chat.completions.create(
+                model=req.model,
+                messages=llm_messages,
+                stream=True
+            )
 
-                for line in resp.iter_lines():
-                    if line:
-                        line_str = line.decode("utf-8")
-                        if line_str.startswith("data: "):
-                            data_str = line_str[6:].strip()
-                            if data_str == "[DONE]":
-                                break
-                            try:
-                                chunk = json.loads(data_str)
-                                delta = chunk["choices"][0]["delta"].get("content", "")
-                                if delta:
-                                    full_response += delta
-                                    yield f"data: {json.dumps({'content': delta})}\n\n"
-                            except Exception:
-                                pass
+            for chunk in stream:
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta.content or ""
+                if delta:
+                    full_response += delta
+                    yield f"data: {json.dumps({'content': delta})}\n\n"
 
             if full_response:
                 assistant_seq = get_next_seq(db, req.conversation_id)
@@ -183,6 +182,9 @@ def chat_stream(req: ChatRequest, db: Session = Depends(get_db)):
 
         except Exception as e:
             db.rollback()
+            # Log complet dans le terminal pour diagnostiquer le 401
+            print(f"[erreur stream] {type(e).__name__}: {e}")
+            print(f"[erreur stream] clé utilisée : {API_KEY[:6]}...{API_KEY[-4:]} | modèle : {req.model}")
             yield f"data: {json.dumps({'error': str(e)})}\n\n"
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
