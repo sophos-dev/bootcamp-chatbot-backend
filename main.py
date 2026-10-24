@@ -1,5 +1,6 @@
 import os
 import json
+import requests
 from typing import List
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.responses import StreamingResponse
@@ -10,31 +11,59 @@ from sqlalchemy import func
 from database.db import get_db, engine, Base  
 from database.models import Conversation, Message
 from openai import OpenAI
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+
+def send_email(to_email: str, subject: str, body: str) -> str:
+    """Envoie un email via SMTP."""
+    smtp_server = os.getenv("SMTP_SERVER", "smtp.gmail.com")
+    smtp_port = int(os.getenv("SMTP_PORT", 587))
+    smtp_user = os.getenv("SMTP_USER")
+    smtp_password = os.getenv("SMTP_PASSWORD")
+    
+    if not smtp_user or not smtp_password:
+        return "Erreur : Identifiants SMTP non configurés dans le fichier .env."
+    
+    try:
+        # Création du message
+        msg = MIMEMultipart()
+        msg["From"] = smtp_user
+        msg["To"] = to_email
+        msg["Subject"] = subject
+        msg.attach(MIMEText(body, "plain"))
+        
+        # Connexion au serveur SMTP et envoi
+        server = smtplib.SMTP(smtp_server, smtp_port)
+        server.starttls()
+        server.login(smtp_user, smtp_password)
+        server.sendmail(smtp_user, to_email, msg.as_string())
+        server.quit()
+        
+        return f"Email envoyé avec succès à {to_email} !"
+    except Exception as e:
+        return f"Erreur technique lors de l'envoi de l'email : {str(e)}"
 
 # override=True : le .env écrase les variables déjà définies dans le système
 load_dotenv(override=True)
 
-app = FastAPI(title="Study Buddy Backend")
+app = FastAPI(title="Study Buddy Backend - Agent Edition")
 
 Base.metadata.create_all(bind=engine)
 ALLOWED_MODELS = [m.strip() for m in os.getenv("ALLOWED_MODELS", "openai/gpt-4o-mini,openai/gpt-4o").split(",")]
-RODIUM_API_URL = "https://api.rodiumai.io/v1/chat/completions"
 
-# Lecture de la clé : on garde tes deux noms possibles, mais on nettoie la valeur
-# (espaces, retours à la ligne, guillemets) et on affiche d'où elle vient.
+# Lecture de la clé Rodium / OpenAI
 _key_name = "RODIUM_API_KEY" if os.getenv("RODIUM_API_KEY") else "RODIUMAI_API_KEY"
 API_KEY = (os.getenv("RODIUM_API_KEY") or os.getenv("RODIUMAI_API_KEY") or "").strip().strip('"').strip("'")
 print(f"[config] variable utilisée : {_key_name}")
 print(f"[config] clé chargée : {API_KEY[:6]}...{API_KEY[-4:]} (longueur {len(API_KEY)})")
-if os.getenv("RODIUM_API_KEY") and os.getenv("RODIUMAI_API_KEY") and os.getenv("RODIUM_API_KEY") != os.getenv("RODIUMAI_API_KEY"):
-    print("[config] ATTENTION : RODIUM_API_KEY et RODIUMAI_API_KEY ont des valeurs différentes")
 
 def load_system_prompt() -> str:
     path = os.path.join("prompts", "system.md")
     if os.path.exists(path):
         with open(path, "r", encoding="utf-8") as f:
             return f.read()
-    return "Tu es Study Buddy, un tuteur pédagogique."
+    return "Tu es un agent IA personnel capable d'utiliser des outils pour aider l'utilisateur."
 
 class ChatRequest(BaseModel):
     conversation_id: int
@@ -49,12 +78,114 @@ def get_next_seq(db: Session, conversation_id: int) -> int:
 def prepare_llm_messages(db_messages: List[Message]) -> List[dict]:
     llm_messages = [{"role": "system", "content": load_system_prompt()}]
     for msg in db_messages:
-        # EXCLUSION : Le rôle "note" est filtré et JAMAIS envoyé au LLM
-        if msg.role in ["user", "assistant", "system"]:
+        if msg.role in ["user", "assistant", "system", "tool"]:
             llm_messages.append({"role": msg.role, "content": msg.content})
     return llm_messages
 
-# --- ROUTES REQUISES PAR LE FRONTEND ---
+
+# ==========================================
+# 🛠️ DÉFINITION DES OUTILS (TOOLS)
+# ==========================================
+
+def get_weather(city: str) -> str:
+    """Récupère la météo actuelle via WeatherAPI."""
+    api_key = os.getenv("WEATHER_API_KEY")
+    if not api_key:
+        return "Erreur : WEATHER_API_KEY non configurée."
+    url = f"http://api.weatherapi.com/v1/current.json?key={api_key}&q={city}&lang=fr"
+    try:
+        res = requests.get(url).json()
+        if "error" in res:
+            return f"Impossible de trouver la météo pour {city}."
+        temp = res["current"]["temp_c"]
+        condition = res["current"]["condition"]["text"]
+        return f"Météo actuelle à {city} : {temp}°C, {condition}."
+    except Exception as e:
+        return f"Erreur technique météo : {str(e)}"
+
+def search_internet(query: str) -> str:
+    """Effectue une recherche web via Tavily Search API."""
+    api_key = os.getenv("TAVILY_API_KEY")
+    if not api_key:
+        return "Erreur : TAVILY_API_KEY non configurée."
+    url = "https://api.tavily.com/search"
+    try:
+        res = requests.post(url, json={"api_key": api_key, "query": query, "max_results": 3}).json()
+        results = res.get("results", [])
+        if not results:
+            return "Aucun résultat trouvé sur Internet."
+        output = []
+        for r in results:
+            output.append(f"- [{r.get('title')}]({r.get('url')}): {r.get('content')}")
+        return "\n".join(output)
+    except Exception as e:
+        return f"Erreur technique recherche : {str(e)}"
+
+
+AVAILABLE_TOOLS = {
+    "get_weather": get_weather,
+    "search_internet": search_internet,
+    "send_email": send_email,  
+}
+
+tools_schema = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Récupère la météo actuelle pour une ville spécifique.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "city": {"type": "string", "description": "Nom de la ville (ex: Paris, Lomé, Dakar)"}
+                },
+                "required": ["city"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_internet",
+            "description": "Recherche des informations actualisées ou des actualités sur Internet.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Mots-clés de la recherche"}
+                },
+                "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "send_email",
+            "description": "Envoie un email à un destinataire avec un objet et un contenu textuel.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "to_email": {
+                        "type": "string",
+                        "description": "Adresse email du destinataire (ex: test@example.com)"
+                    },
+                    "subject": {
+                        "type": "string",
+                        "description": "L'objet de l'email"
+                    },
+                    "body": {
+                        "type": "string",
+                        "description": "Le texte / contenu principal du message"
+                    }
+                },
+                "required": ["to_email", "subject", "body"]
+            }
+        }
+    }
+]
+
+
+# --- ROUTES DE BASE ---
 
 @app.get("/models")
 def get_models():
@@ -105,13 +236,13 @@ def get_messages(conversation_id: int, db: Session = Depends(get_db)):
         for m in msgs
     ]
 
-# Initialisation du client Rodium (avec la clé nettoyée ci-dessus)
+# Initialisation du client OpenAI / Rodium
 client = OpenAI(
     api_key=API_KEY,
     base_url="https://api.rodiumai.io/v1",
 )
 
-# --- ENDPOINT STREAMING ---
+# --- ENDPOINT STREAMING AVEC TOOL CALLING ---
 
 @app.post("/chat/stream")
 def chat_stream(req: ChatRequest, db: Session = Depends(get_db)):
@@ -152,13 +283,57 @@ def chat_stream(req: ChatRequest, db: Session = Depends(get_db)):
     def event_generator():
         full_response = ""
         try:
-            # Appel officiel via le SDK OpenAI pointant sur Rodium
-            stream = client.chat.completions.create(
+            # 1. Premier appel non-streaming pour vérifier si le LLM veut appeler un outil
+            first_response = client.chat.completions.create(
                 model=req.model,
                 messages=llm_messages,
-                stream=True
+                tools=tools_schema,
+                tool_choice="auto",
+                stream=False
             )
+            
+            response_message = first_response.choices[0].message
 
+            # 2. Si le LLM demande à appeler un ou plusieurs outils
+            if response_message.tool_calls:
+                # On ajoute la décision de l'outil à l'historique de messages
+                llm_messages.append(response_message)
+
+                for tool_call in response_message.tool_calls:
+                    function_name = tool_call.function.name
+                    function_args = json.loads(tool_call.function.arguments)
+
+                    print(f"[Agent] Appel de l'outil : {function_name} avec les arguments : {function_args}")
+
+                    # Exécution de la fonction Python correspondante
+                    if function_name in AVAILABLE_TOOLS:
+                        tool_output = AVAILABLE_TOOLS[function_name](**function_args)
+                    else:
+                        tool_output = f"Erreur : Outil {function_name} inconnu."
+
+                    # On ajoute le résultat de l'outil dans les messages
+                    llm_messages.append({
+                        "tool_call_id": tool_call.id,
+                        "role": "tool",
+                        "name": function_name,
+                        "content": str(tool_output)
+                    })
+
+                # 3. Deuxième appel (en streaming cette fois) pour générer la réponse finale avec le résultat de l'outil
+                stream = client.chat.completions.create(
+                    model=req.model,
+                    messages=llm_messages,
+                    stream=True
+                )
+            else:
+                # Si aucun outil n'est nécessaire, on lance directement le stream classique
+                stream = client.chat.completions.create(
+                    model=req.model,
+                    messages=llm_messages,
+                    stream=True
+                )
+
+            # Lecture et envoi des chunks au frontend
             for chunk in stream:
                 if not chunk.choices:
                     continue
@@ -182,9 +357,7 @@ def chat_stream(req: ChatRequest, db: Session = Depends(get_db)):
 
         except Exception as e:
             db.rollback()
-            # Log complet dans le terminal pour diagnostiquer le 401
             print(f"[erreur stream] {type(e).__name__}: {e}")
-            print(f"[erreur stream] clé utilisée : {API_KEY[:6]}...{API_KEY[-4:]} | modèle : {req.model}")
             yield f"data: {json.dumps({'error': str(e)})}\n\n"
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
